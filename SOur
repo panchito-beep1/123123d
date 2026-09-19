@@ -2,12 +2,13 @@
 --// Watches for a target player; when they join, hop to a new server.
 --// Persists target name + toggle state across hops.
 
+--// Server Hop Tracker — Axiom UI
+--// Watches for a target player; when they join, hop to a new server.
+--// Persists target name + toggle state across hops.
+
 -- ══════════════════════════════════════════════════════════════════
 --  CONFIG — fill this in if you host the script somewhere
 -- ══════════════════════════════════════════════════════════════════
--- Method B2 fallback: if Method A AND the source cache both fail,
--- the script queues a loadstring from this URL instead.
--- Leave empty ("") to disable B2.
 local LOADER_URL = "https://raw.githubusercontent.com/panchito-beep1/123123d/refs/heads/main/SOur"
 
 -- ══════════════════════════════════════════════════════════════════
@@ -35,8 +36,6 @@ local ENV = (function()
     return _G
 end)()
 
--- Availability only — does NOT prove the function works with our args.
--- Real capability tests (below) do the actual invocation.
 local function hasFn(name)
     local fn = ENV[name]
     if type(fn) ~= "function" then fn = _G[name] end
@@ -49,7 +48,6 @@ caps.queueOnTeleport = hasFn("queue_on_teleport")
 --=====================================================================
 -- Persistence roundtrip test
 --=====================================================================
--- Existence isn't enough — we actually write, read back, and verify.
 local function testPersistence()
     if not (hasFn("writefile") and hasFn("readfile")) then
         return false, "writefile/readfile missing"
@@ -90,14 +88,11 @@ for _, name in ipairs(SOURCE_FNS) do
 end
 
 --=====================================================================
--- Source retrieval (Method A) with proper argument handling
+-- Source retrieval (Method A)
 --=====================================================================
--- Build a list of "candidate self objects" — things an executor's
--- getscriptsource/decompile might accept as the script we're running in.
 local function collectCandidates()
     local candidates = {}
 
-    -- 1. getscriptclosure() — no-arg form commonly returns our closure
     if fnAvailable.getscriptclosure then
         local ok, closure = pcall(getscriptclosure)
         if ok and closure ~= nil then
@@ -105,13 +100,11 @@ local function collectCandidates()
         end
     end
 
-    -- 2. `script` global — the LocalScript we're inside, if any
     local okScript, scriptVal = pcall(function() return script end)
     if okScript and scriptVal ~= nil then
         table.insert(candidates, { obj = scriptVal, name = "script" })
     end
 
-    -- 3. debug.info of surrounding stack frames — grab each level's fn
     local infoFn = (debug and (debug.info or debug.getinfo))
     if infoFn then
         for level = 1, 6 do
@@ -128,11 +121,9 @@ local function collectCandidates()
     return candidates
 end
 
--- Try every strategy with real arguments until we get non-empty source.
 local function tryGetSource()
     local candidates = collectCandidates()
 
-    -- Strategy 1: getscriptsource(obj) for each candidate
     if fnAvailable.getscriptsource then
         for _, c in ipairs(candidates) do
             local ok, src = pcall(getscriptsource, c.obj)
@@ -140,14 +131,12 @@ local function tryGetSource()
                 return src, "getscriptsource(" .. c.name .. ")"
             end
         end
-        -- Some executors also accept the no-arg form; try last.
         local ok, src = pcall(getscriptsource)
         if ok and type(src) == "string" and src ~= "" then
             return src, "getscriptsource()"
         end
     end
 
-    -- Strategy 2: decompile(obj) for each candidate
     if fnAvailable.decompile then
         for _, c in ipairs(candidates) do
             local ok, src = pcall(decompile, c.obj)
@@ -157,9 +146,6 @@ local function tryGetSource()
         end
     end
 
-    -- Strategy 3 (last resort): getscriptbytecode() → decompile(bytecode)
-    -- Unreliable — some decompilers only accept closures, not bytecode.
-    -- Kept only because a minority of executors do accept it.
     if fnAvailable.getscriptbytecode and fnAvailable.decompile then
         local ok, bc = pcall(getscriptbytecode)
         if ok and type(bc) == "string" and bc ~= "" then
@@ -180,7 +166,6 @@ local SCRIPT_SOURCE, SOURCE_METHOD = tryGetSource()
 --=====================================================================
 local SOURCE_CACHE_FILE = "serverhop_tracker_source.lua"
 
--- Only treat the cache as valid if we can read it back non-empty.
 local function hasCache()
     if not caps.persistence then return false end
     if not isfile(SOURCE_CACHE_FILE) then return false end
@@ -192,7 +177,6 @@ local cacheWrittenThisRun = false
 if SCRIPT_SOURCE and caps.persistence then
     local ok = pcall(writefile, SOURCE_CACHE_FILE, SCRIPT_SOURCE)
     if ok then
-        -- Verify by reading it back (same rigor as persistence test).
         local ok2, content = pcall(readfile, SOURCE_CACHE_FILE)
         if ok2 and content == SCRIPT_SOURCE then
             cacheWrittenThisRun = true
@@ -205,29 +189,15 @@ if SCRIPT_SOURCE and caps.persistence then
     end
 end
 
---=====================================================================
--- Loader URL (Method B2)
---=====================================================================
 local function hasLoaderUrl()
     return LOADER_URL ~= "" and type(game.HttpGet) == "function"
 end
 
---=====================================================================
--- HttpGet — existence only
---=====================================================================
--- We deliberately do NOT make a test request here. Whether a specific
--- URL resolves is orthogonal to whether the method is exposed, and a
--- blocked test request would produce a false negative. The real
--- network call is exercised in findServer().
 caps.httpGet = type(game.HttpGet) == "function"
 
 --=====================================================================
--- Resolve reload mode (the actual capability chain)
+-- Resolve reload mode
 --=====================================================================
---   direct  → we grabbed our own source this run
---   cache   → source cache file is readable
---   url     → LOADER_URL is configured + HttpGet exists
---   nil     → auto-reload unavailable; be honest about it
 local reloadMode
 if SCRIPT_SOURCE and caps.queueOnTeleport then
     reloadMode = "direct"
@@ -240,7 +210,7 @@ else
 end
 
 --=====================================================================
--- Persistence (real, using verified capability)
+-- Persistence
 --=====================================================================
 local CONFIG_FILE = "serverhop_tracker_config.json"
 
@@ -281,6 +251,24 @@ local function persist()
 end
 
 --=====================================================================
+-- Async teleport failure handler
+--=====================================================================
+-- TeleportToPlaceInstance can return WITHOUT error and still fail later
+-- (throttled, teleport queue full, target instance gone, etc.). When
+-- that happens we must reset `state.hopping` — otherwise the script
+-- sits with hopping=true forever and never fires again.
+TeleportService.TeleportInitFailed:Connect(function(plr, result, errMsg)
+    if plr ~= LocalPlayer then return end
+    warn(string.format(
+        "[ServerHopTracker] TeleportInitFailed: %s — %s",
+        tostring(result), tostring(errMsg)
+    ))
+    state.hopping = false
+    state.status = "TP failed: " .. tostring(result)
+    if updateStatus then updateStatus() end
+end)
+
+--=====================================================================
 -- Server hop logic
 --=====================================================================
 local function findServer()
@@ -301,12 +289,6 @@ local function findServer()
     return nil
 end
 
--- Build the SOURCE STRING handed to queue_on_teleport.
--- queue_on_teleport executes the given string as new code in the
--- destination session — no locals, closures, or upvalues survive.
---   direct → full script source grabbed via Method A
---   cache  → one-liner that loads our cached .lua and runs it
---   url    → one-liner that fetches LOADER_URL and runs it
 local function buildReloadPayload()
     if reloadMode == "direct" and SCRIPT_SOURCE then
         return SCRIPT_SOURCE
@@ -320,16 +302,15 @@ local function buildReloadPayload()
     return nil
 end
 
-local function serverHop()
-    if state.hopping then return end
+-- force = ignore the hopping guard (used by the Retry button)
+local function serverHop(force)
+    if state.hopping and not force then return end
     state.hopping = true
 
     state.status = "Hopping..."
     updateStatus()
     persist()
 
-    -- Queue reload payload BEFORE teleporting. This invocation is the
-    -- real test of queue_on_teleport — if it fails, we log it loudly.
     if reloadMode then
         local payload = buildReloadPayload()
         if payload then
@@ -348,18 +329,33 @@ local function serverHop()
             TeleportService:TeleportToPlaceInstance(PlaceId, target, LocalPlayer)
         end)
         if not ok then
-            warn("[ServerHopTracker] Teleport failed: " .. tostring(err))
-            state.status = "TP failed"
+            warn("[ServerHopTracker] Teleport call threw: " .. tostring(err))
+            state.status = "TP error"
             state.hopping = false
             updateStatus()
         end
+        -- NOTE: success here does NOT guarantee the teleport goes
+        -- through. If it fails asynchronously, TeleportInitFailed
+        -- above resets state.hopping.
     else
         state.status = caps.httpGet and "No servers found" or "Random hop"
         updateStatus()
-        pcall(function()
+        local ok = pcall(function()
             TeleportService:Teleport(PlaceId, LocalPlayer)
         end)
+        if not ok then
+            state.hopping = false
+            updateStatus()
+        end
     end
+end
+
+-- Force-reset the hopping lock and retry from scratch.
+local function retryTeleport()
+    state.hopping = false
+    state.status = "Retrying..."
+    updateStatus()
+    serverHop(true)
 end
 
 --=====================================================================
@@ -413,6 +409,10 @@ tab:AddButton("Hop Now", function()
     serverHop()
 end, { Color = Color3.fromRGB(0, 170, 90) })
 
+tab:AddButton("Retry Teleport", function()
+    retryTeleport()
+end, { Color = Color3.fromRGB(220, 50, 50) })
+
 --=====================================================================
 -- Live status table
 --=====================================================================
@@ -436,6 +436,7 @@ local function buildRows()
         {"Target",        state.targetName ~= "" and state.targetName or "<none>"},
         {"Enabled",       state.enabled and "ON" or "OFF"},
         {"Status",        state.status},
+        {"Hopping lock",  state.hopping and "ENGAGED" or "released"},
         {"Auto-reload",   reloadMode and "supported" or "NOT supported"},
         {"Reload method", reloadModeLabel()},
         {"Source method", SOURCE_METHOD or "<none>"},
@@ -445,11 +446,11 @@ local function buildRows()
     }
 end
 
-local statusTable = tab:AddTable(STATUS_HEADERS, buildRows(), {MaxHeight = 200})
+local statusTable = tab:AddTable(STATUS_HEADERS, buildRows(), {MaxHeight = 220})
 
 updateStatus = function()
     statusTable:Destroy()
-    statusTable = tab:AddTable(STATUS_HEADERS, buildRows(), {MaxHeight = 200})
+    statusTable = tab:AddTable(STATUS_HEADERS, buildRows(), {MaxHeight = 220})
 end
 
 --=====================================================================
@@ -505,4 +506,4 @@ if #missing > 0 then
             { Text = "OK", Callback = function() end },
         },
     })
-end    
+end
