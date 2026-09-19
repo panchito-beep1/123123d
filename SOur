@@ -1,15 +1,22 @@
 --// Server Hop Tracker — Axiom UI
---// Watches for a target player; when they join, hop to a new server.
---// Persists target name + toggle state across hops.
-
---// Server Hop Tracker — Axiom UI
---// Watches for a target player; when they join, hop to a new server.
+--// Watches for a target player; when they join, hop to a new server.asdasdasdasdasdasdaadddddddddddddddddddddddddddddddddddddddddddddddddddddd
 --// Persists target name + toggle state across hops.
 
 -- ══════════════════════════════════════════════════════════════════
 --  CONFIG — fill this in if you host the script somewhere
 -- ══════════════════════════════════════════════════════════════════
 local LOADER_URL = "https://raw.githubusercontent.com/panchito-beep1/123123d/refs/heads/main/SOur"
+
+-- How many servers to try in one hop session before giving up.
+local MAX_ATTEMPTS = 10
+
+-- How many free slots a server must have before we'll consider it.
+-- Leave headroom: the Roblox API can be a few seconds stale, and by
+-- the time we actually teleport, a "1 slot left" server is already full.
+local SLOT_HEADROOM = 2
+
+-- Delay between retry attempts (seconds). Prevents throttling.
+local RETRY_DELAY = 1.5
 
 -- ══════════════════════════════════════════════════════════════════
 
@@ -26,7 +33,7 @@ local PlaceId     = game.PlaceId
 local JobId       = game.JobId
 
 --=====================================================================
--- Environment resolution + availability probe
+-- Environment + availability
 --=====================================================================
 local ENV = (function()
     if type(getgenv) == "function" then
@@ -46,7 +53,7 @@ local caps = {}
 caps.queueOnTeleport = hasFn("queue_on_teleport")
 
 --=====================================================================
--- Persistence roundtrip test
+-- Persistence roundtrip
 --=====================================================================
 local function testPersistence()
     if not (hasFn("writefile") and hasFn("readfile")) then
@@ -67,7 +74,7 @@ local persistenceOK, persistenceReason = testPersistence()
 caps.persistence = persistenceOK
 
 --=====================================================================
--- Source-function availability (informational)
+-- Source-function availability
 --=====================================================================
 local SOURCE_FNS = {
     "getscriptsource",
@@ -196,7 +203,7 @@ end
 caps.httpGet = type(game.HttpGet) == "function"
 
 --=====================================================================
--- Resolve reload mode
+-- Reload mode
 --=====================================================================
 local reloadMode
 if SCRIPT_SOURCE and caps.queueOnTeleport then
@@ -242,37 +249,29 @@ local state = {
     enabled    = cfg.enabled,
     status     = "Idle",
     hopping    = false,
+
+    -- Hop session tracking
+    serverQueue   = {},   -- array of {id=..., playing=..., maxPlayers=...}
+    blacklist     = {},   -- [jobId] = true
+    attemptCount  = 0,
+    currentServer = nil,  -- the candidate we last handed to TeleportToPlaceInstance
 }
 
 local updateStatus  -- forward declaration
+local tryNextServer -- forward declaration
 
 local function persist()
     saveConfig({ targetName = state.targetName, enabled = state.enabled })
 end
 
 --=====================================================================
--- Async teleport failure handler
+-- Server candidate fetch
 --=====================================================================
--- TeleportToPlaceInstance can return WITHOUT error and still fail later
--- (throttled, teleport queue full, target instance gone, etc.). When
--- that happens we must reset `state.hopping` — otherwise the script
--- sits with hopping=true forever and never fires again.
-TeleportService.TeleportInitFailed:Connect(function(plr, result, errMsg)
-    if plr ~= LocalPlayer then return end
-    warn(string.format(
-        "[ServerHopTracker] TeleportInitFailed: %s — %s",
-        tostring(result), tostring(errMsg)
-    ))
-    state.hopping = false
-    state.status = "TP failed: " .. tostring(result)
-    if updateStatus then updateStatus() end
-end)
+-- Returns an array of candidate servers sorted emptiest-first, with
+-- already-blacklisted servers and the current server excluded.
+local function fetchCandidates()
+    if not caps.httpGet then return {} end
 
---=====================================================================
--- Server hop logic
---=====================================================================
-local function findServer()
-    if not caps.httpGet then return nil end
     local url = string.format(
         "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100",
         PlaceId
@@ -280,15 +279,75 @@ local function findServer()
     local ok, res = pcall(function()
         return HttpService:JSONDecode(game:HttpGet(url))
     end)
-    if not ok or type(res) ~= "table" or not res.data then return nil end
+    if not ok or type(res) ~= "table" or not res.data then return {} end
+
+    local list = {}
     for _, s in ipairs(res.data) do
-        if s.id ~= JobId and s.playing < s.maxPlayers then
-            return s.id
+        local free = (s.maxPlayers or 0) - (s.playing or 0)
+        if s.id ~= JobId
+            and not state.blacklist[s.id]
+            and s.playing ~= nil and s.maxPlayers ~= nil
+            and free >= SLOT_HEADROOM then
+            table.insert(list, {
+                id = s.id,
+                playing = s.playing,
+                maxPlayers = s.maxPlayers,
+                free = free,
+            })
+        end
+    end
+
+    -- Emptiest first (largest `free`, then lowest fill ratio)
+    table.sort(list, function(a, b)
+        if a.free ~= b.free then return a.free > b.free end
+        return (a.playing / a.maxPlayers) < (b.playing / b.maxPlayers)
+    end)
+
+    return list
+end
+
+local function nextCandidate()
+    while #state.serverQueue > 0 do
+        local s = table.remove(state.serverQueue, 1)
+        if not state.blacklist[s.id] then
+            return s
         end
     end
     return nil
 end
 
+--=====================================================================
+-- Async teleport failure handler (drives the retry chain)
+--=====================================================================
+TeleportService.TeleportInitFailed:Connect(function(plr, result, errMsg)
+    if plr ~= LocalPlayer then return end
+
+    local resultName = (typeof(result) == "EnumItem" and result.Name) or tostring(result)
+    warn(string.format(
+        "[ServerHopTracker] TeleportInitFailed: %s — %s",
+        resultName, tostring(errMsg)
+    ))
+
+    -- Blacklist the server we just tried so we don't waste an attempt
+    if state.currentServer then
+        state.blacklist[state.currentServer.id] = true
+        state.currentServer = nil
+    end
+
+    if state.hopping then
+        -- Still in a hop session → try the next candidate
+        state.status = string.format("Retry after %s...", resultName)
+        updateStatus()
+        task.delay(RETRY_DELAY, tryNextServer)
+    else
+        state.status = "TP failed: " .. resultName
+        updateStatus()
+    end
+end)
+
+--=====================================================================
+-- Hop logic
+--=====================================================================
 local function buildReloadPayload()
     if reloadMode == "direct" and SCRIPT_SOURCE then
         return SCRIPT_SOURCE
@@ -302,11 +361,67 @@ local function buildReloadPayload()
     return nil
 end
 
--- force = ignore the hopping guard (used by the Retry button)
-local function serverHop(force)
-    if state.hopping and not force then return end
-    state.hopping = true
+tryNextServer = function()
+    if not state.hopping then return end
 
+    state.attemptCount = state.attemptCount + 1
+
+    if state.attemptCount > MAX_ATTEMPTS then
+        state.hopping = false
+        state.status = string.format("Gave up after %d attempts", MAX_ATTEMPTS)
+        updateStatus()
+        return
+    end
+
+    -- Pop the next untried candidate; refetch if the queue is empty.
+    local server = nextCandidate()
+    if not server then
+        state.serverQueue = fetchCandidates()
+        server = nextCandidate()
+    end
+
+    if not server then
+        state.hopping = false
+        state.status = "No servers with free slots"
+        updateStatus()
+        return
+    end
+
+    state.currentServer = server
+    state.status = string.format(
+        "Attempt %d/%d — %d/%d slots (%d free)",
+        state.attemptCount, MAX_ATTEMPTS,
+        server.playing, server.maxPlayers, server.free
+    )
+    updateStatus()
+
+    -- Actual teleport call. May throw (throttle) or return silently
+    -- and fail async via TeleportInitFailed above — both are handled.
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(PlaceId, server.id, LocalPlayer)
+    end)
+    if not ok then
+        warn("[ServerHopTracker] Teleport call threw: " .. tostring(err))
+        state.blacklist[server.id] = true
+        state.currentServer = nil
+        if state.hopping then
+            task.delay(RETRY_DELAY, tryNextServer)
+        end
+    end
+end
+
+-- fresh = clear session state (used by detection trigger + Retry button)
+local function serverHop(force, fresh)
+    if state.hopping and not force then return end
+
+    if fresh then
+        state.blacklist = {}
+        state.serverQueue = {}
+        state.attemptCount = 0
+        state.currentServer = nil
+    end
+
+    state.hopping = true
     state.status = "Hopping..."
     updateStatus()
     persist()
@@ -318,44 +433,15 @@ local function serverHop(force)
             if not ok then
                 warn("[ServerHopTracker] queue_on_teleport failed: " .. tostring(err))
             end
-        else
-            warn("[ServerHopTracker] reloadMode is set but payload was nil.")
         end
     end
 
-    local target = findServer()
-    if target then
-        local ok, err = pcall(function()
-            TeleportService:TeleportToPlaceInstance(PlaceId, target, LocalPlayer)
-        end)
-        if not ok then
-            warn("[ServerHopTracker] Teleport call threw: " .. tostring(err))
-            state.status = "TP error"
-            state.hopping = false
-            updateStatus()
-        end
-        -- NOTE: success here does NOT guarantee the teleport goes
-        -- through. If it fails asynchronously, TeleportInitFailed
-        -- above resets state.hopping.
-    else
-        state.status = caps.httpGet and "No servers found" or "Random hop"
-        updateStatus()
-        local ok = pcall(function()
-            TeleportService:Teleport(PlaceId, LocalPlayer)
-        end)
-        if not ok then
-            state.hopping = false
-            updateStatus()
-        end
-    end
+    tryNextServer()
 end
 
--- Force-reset the hopping lock and retry from scratch.
 local function retryTeleport()
     state.hopping = false
-    state.status = "Retrying..."
-    updateStatus()
-    serverHop(true)
+    serverHop(true, true)
 end
 
 --=====================================================================
@@ -366,7 +452,7 @@ local function checkPlayer(plr)
     if state.targetName == "" then return end
     if plr == LocalPlayer then return end
     if plr.Name:lower() == state.targetName:lower() then
-        serverHop()
+        serverHop(false, true)
     end
 end
 
@@ -406,7 +492,7 @@ end)
 tab:AddSeparator()
 
 tab:AddButton("Hop Now", function()
-    serverHop()
+    serverHop(false, true)
 end, { Color = Color3.fromRGB(0, 170, 90) })
 
 tab:AddButton("Retry Teleport", function()
@@ -431,12 +517,21 @@ local function cacheStatusLabel()
     return "no"
 end
 
+local function blacklistCount()
+    local n = 0
+    for _ in pairs(state.blacklist) do n = n + 1 end
+    return n
+end
+
 local function buildRows()
     return {
         {"Target",        state.targetName ~= "" and state.targetName or "<none>"},
         {"Enabled",       state.enabled and "ON" or "OFF"},
         {"Status",        state.status},
         {"Hopping lock",  state.hopping and "ENGAGED" or "released"},
+        {"Attempt",       string.format("%d / %d", state.attemptCount, MAX_ATTEMPTS)},
+        {"Queue",         string.format("%d servers", #state.serverQueue)},
+        {"Blacklisted",   tostring(blacklistCount())},
         {"Auto-reload",   reloadMode and "supported" or "NOT supported"},
         {"Reload method", reloadModeLabel()},
         {"Source method", SOURCE_METHOD or "<none>"},
@@ -446,11 +541,11 @@ local function buildRows()
     }
 end
 
-local statusTable = tab:AddTable(STATUS_HEADERS, buildRows(), {MaxHeight = 220})
+local statusTable = tab:AddTable(STATUS_HEADERS, buildRows(), {MaxHeight = 280})
 
 updateStatus = function()
     statusTable:Destroy()
-    statusTable = tab:AddTable(STATUS_HEADERS, buildRows(), {MaxHeight = 220})
+    statusTable = tab:AddTable(STATUS_HEADERS, buildRows(), {MaxHeight = 280})
 end
 
 --=====================================================================
@@ -467,7 +562,7 @@ end
 tab:AddTable(DIAG_HEADERS, diagRows, {MaxHeight = 160})
 
 --=====================================================================
--- Capability warnings (dialogs)
+-- Capability warnings
 --=====================================================================
 local missing = {}
 if not caps.persistence then
@@ -478,7 +573,7 @@ end
 if not caps.queueOnTeleport then
     table.insert(missing,
         "• queue_on_teleport is missing\n"
-        .. "   →  script will NOT auto-restart after a hop, regardless of source retrieval")
+        .. "   →  script will NOT auto-restart after a hop")
 elseif not reloadMode then
     local why
     if not SCRIPT_SOURCE and not hasCache() and not hasLoaderUrl() then
@@ -493,7 +588,7 @@ end
 if not caps.httpGet then
     table.insert(missing,
         "• game.HttpGet is missing\n"
-        .. "   →  server lookup will fall back to a random hop, and Method B2 (loader URL) is unavailable")
+        .. "   →  server lookup unavailable; script will fall back to a random hop")
 end
 
 if #missing > 0 then
