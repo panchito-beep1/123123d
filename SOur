@@ -1,5 +1,5 @@
 --// Server Hop Tracker — Axiom UI
---// Watches for a target player; when they join, hop to a new server.asdasdasdasdasdasdaadddddddddddddddddddddddddddddddddddddddddddddddddddddd
+--// Watches for a target player; when they join, hop to a new server.
 --// Persists target name + toggle state across hops.
 
 -- ══════════════════════════════════════════════════════════════════
@@ -7,16 +7,13 @@
 -- ══════════════════════════════════════════════════════════════════
 local LOADER_URL = "https://raw.githubusercontent.com/panchito-beep1/123123d/refs/heads/main/SOur"
 
--- How many servers to try in one hop session before giving up.
 local MAX_ATTEMPTS = 10
-
--- How many free slots a server must have before we'll consider it.
--- Leave headroom: the Roblox API can be a few seconds stale, and by
--- the time we actually teleport, a "1 slot left" server is already full.
 local SLOT_HEADROOM = 2
-
--- Delay between retry attempts (seconds). Prevents throttling.
 local RETRY_DELAY = 1.5
+
+-- Tick interval for the presence loop. Roblox clamps task.wait() to
+-- ~1 frame (≈0.0167s at 60 FPS), so 0.01 is effectively per-frame.
+local TICK_INTERVAL = 0.01
 
 -- ══════════════════════════════════════════════════════════════════
 
@@ -250,15 +247,19 @@ local state = {
     status     = "Idle",
     hopping    = false,
 
+    -- Presence tracking (loop-driven)
+    targetPresent         = false,
+    triggeredForPresence  = false,
+
     -- Hop session tracking
-    serverQueue   = {},   -- array of {id=..., playing=..., maxPlayers=...}
-    blacklist     = {},   -- [jobId] = true
+    serverQueue   = {},
+    blacklist     = {},
     attemptCount  = 0,
-    currentServer = nil,  -- the candidate we last handed to TeleportToPlaceInstance
+    currentServer = nil,
 }
 
-local updateStatus  -- forward declaration
-local tryNextServer -- forward declaration
+local updateStatus   -- forward declaration
+local tryNextServer  -- forward declaration
 
 local function persist()
     saveConfig({ targetName = state.targetName, enabled = state.enabled })
@@ -267,8 +268,6 @@ end
 --=====================================================================
 -- Server candidate fetch
 --=====================================================================
--- Returns an array of candidate servers sorted emptiest-first, with
--- already-blacklisted servers and the current server excluded.
 local function fetchCandidates()
     if not caps.httpGet then return {} end
 
@@ -297,7 +296,6 @@ local function fetchCandidates()
         end
     end
 
-    -- Emptiest first (largest `free`, then lowest fill ratio)
     table.sort(list, function(a, b)
         if a.free ~= b.free then return a.free > b.free end
         return (a.playing / a.maxPlayers) < (b.playing / b.maxPlayers)
@@ -317,7 +315,7 @@ local function nextCandidate()
 end
 
 --=====================================================================
--- Async teleport failure handler (drives the retry chain)
+-- Async teleport failure handler
 --=====================================================================
 TeleportService.TeleportInitFailed:Connect(function(plr, result, errMsg)
     if plr ~= LocalPlayer then return end
@@ -328,14 +326,12 @@ TeleportService.TeleportInitFailed:Connect(function(plr, result, errMsg)
         resultName, tostring(errMsg)
     ))
 
-    -- Blacklist the server we just tried so we don't waste an attempt
     if state.currentServer then
         state.blacklist[state.currentServer.id] = true
         state.currentServer = nil
     end
 
     if state.hopping then
-        -- Still in a hop session → try the next candidate
         state.status = string.format("Retry after %s...", resultName)
         updateStatus()
         task.delay(RETRY_DELAY, tryNextServer)
@@ -373,7 +369,6 @@ tryNextServer = function()
         return
     end
 
-    -- Pop the next untried candidate; refetch if the queue is empty.
     local server = nextCandidate()
     if not server then
         state.serverQueue = fetchCandidates()
@@ -395,8 +390,6 @@ tryNextServer = function()
     )
     updateStatus()
 
-    -- Actual teleport call. May throw (throttle) or return silently
-    -- and fail async via TeleportInitFailed above — both are handled.
     local ok, err = pcall(function()
         TeleportService:TeleportToPlaceInstance(PlaceId, server.id, LocalPlayer)
     end)
@@ -410,7 +403,6 @@ tryNextServer = function()
     end
 end
 
--- fresh = clear session state (used by detection trigger + Retry button)
 local function serverHop(force, fresh)
     if state.hopping and not force then return end
 
@@ -441,28 +433,66 @@ end
 
 local function retryTeleport()
     state.hopping = false
+    state.triggeredForPresence = false  -- allow detection loop to re-trigger
     serverHop(true, true)
 end
 
 --=====================================================================
--- Detection
+-- Presence loop (constant check)
 --=====================================================================
-local function checkPlayer(plr)
-    if not state.enabled then return end
+-- Runs every tick. Handles three transitions:
+--   target absent → present : refresh status, fire hop if armed
+--   target present → absent : reset trigger latch so next join re-fires
+--   (no change)              : no-op
+--
+-- `triggeredForPresence` debounces: while the target is continuously
+-- in the server, we only fire serverHop() once. If the hop fails and
+-- we're still here, the latch stays engaged until the target leaves
+-- or the user hits Retry.
+local function tick()
     if state.targetName == "" then return end
-    if plr == LocalPlayer then return end
-    if plr.Name:lower() == state.targetName:lower() then
+
+    local present = false
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and plr.Name:lower() == state.targetName:lower() then
+            present = true
+            break
+        end
+    end
+
+    if present ~= state.targetPresent then
+        state.targetPresent = present
+
+        if present then
+            state.status = "Target detected"
+            print("[ServerHopTracker] Target present: " .. state.targetName)
+        else
+            state.triggeredForPresence = false
+            state.status = "Target left"
+            print("[ServerHopTracker] Target left: " .. state.targetName)
+        end
+
+        updateStatus()
+    end
+
+    if state.enabled
+        and present
+        and not state.triggeredForPresence
+        and not state.hopping then
+        state.triggeredForPresence = true
         serverHop(false, true)
     end
 end
 
-Players.PlayerAdded:Connect(function(plr)
-    task.spawn(checkPlayer, plr)
+task.spawn(function()
+    while true do
+        local ok, err = pcall(tick)
+        if not ok then
+            warn("[ServerHopTracker] tick error: " .. tostring(err))
+        end
+        task.wait(TICK_INTERVAL)
+    end
 end)
-
-for _, plr in ipairs(Players:GetPlayers()) do
-    task.spawn(checkPlayer, plr)
-end
 
 --=====================================================================
 -- Axiom GUI
@@ -478,6 +508,9 @@ tab:AddTextBox(
     state.targetName,
     function(text)
         state.targetName = text
+        -- Reset presence latch when target name changes.
+        state.targetPresent = false
+        state.triggeredForPresence = false
         persist()
         updateStatus()
     end
@@ -485,6 +518,10 @@ tab:AddTextBox(
 
 tab:AddCheckbox("Enable Auto Server Hop", state.enabled, function(on)
     state.enabled = on
+    if not on then
+        -- Disarming: clear the latch so re-enabling re-checks.
+        state.triggeredForPresence = false
+    end
     persist()
     updateStatus()
 end)
@@ -526,6 +563,8 @@ end
 local function buildRows()
     return {
         {"Target",        state.targetName ~= "" and state.targetName or "<none>"},
+        {"Target present",state.targetPresent and "YES" or "no"},
+        {"Trigger latch", state.triggeredForPresence and "engaged" or "ready"},
         {"Enabled",       state.enabled and "ON" or "OFF"},
         {"Status",        state.status},
         {"Hopping lock",  state.hopping and "ENGAGED" or "released"},
@@ -541,11 +580,11 @@ local function buildRows()
     }
 end
 
-local statusTable = tab:AddTable(STATUS_HEADERS, buildRows(), {MaxHeight = 280})
+local statusTable = tab:AddTable(STATUS_HEADERS, buildRows(), {MaxHeight = 320})
 
 updateStatus = function()
     statusTable:Destroy()
-    statusTable = tab:AddTable(STATUS_HEADERS, buildRows(), {MaxHeight = 280})
+    statusTable = tab:AddTable(STATUS_HEADERS, buildRows(), {MaxHeight = 320})
 end
 
 --=====================================================================
