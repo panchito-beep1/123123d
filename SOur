@@ -8,7 +8,7 @@
 -- Method B2 fallback: if Method A AND the source cache both fail,
 -- the script queues a loadstring from this URL instead.
 -- Leave empty ("") to disable B2.
-local LOADER_URL = ""
+local LOADER_URL = "https://raw.githubusercontent.com/panchito-beep1/123123d/refs/heads/main/SOur"
 
 -- ══════════════════════════════════════════════════════════════════
 
